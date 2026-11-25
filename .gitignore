@@ -31,8 +31,7 @@ ENV/
 
 # Model files
 *.pt
-!models/pretrained/yolov8n.pt
-!training_output/drone_detector/weights/best.pt
+!models/drone_best.pt
 
 # Misc
 .DS_Store
@@ -73,3 +72,4 @@ training_output/
 output/
 runs/
 *.mp4
+!assets/demo_detection.mp4
