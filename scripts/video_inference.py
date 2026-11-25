@@ -1,176 +1,100 @@
-from ultralytics import YOLO
-import cv2
-import os
-import time
+"""Run the drone detector on a video file or webcam, writing an annotated video."""
 import argparse
-import logging
-from datetime import datetime
+import time
 from pathlib import Path
-from tqdm import tqdm
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+import cv2
 
-def ensure_dir(directory):
-    if not os.path.exists(directory):
-        os.makedirs(directory)
+from common import ROOT, die, has_display, pick_device, resolve_weights
 
-def get_fps():
-    """Calculate FPS using a moving average"""
-    return getattr(get_fps, 'fps', 0)
 
-def update_fps(frame_time):
-    """Update FPS calculation"""
-    if not hasattr(get_fps, 'times'):
-        get_fps.times = []
-    
-    get_fps.times.append(frame_time)
-    if len(get_fps.times) > 30:  # Keep only last 30 frames for moving average
-        get_fps.times.pop(0)
-    
-    get_fps.fps = len(get_fps.times) / sum(get_fps.times)
+def process_video(source, weights=None, conf=0.45, iou=0.7, out_path=None, show=False,
+                  max_frames=0, device=None, imgsz=416):
+    """Annotate a video. Returns stats dict. source may be a path or int (webcam index)."""
+    cap = cv2.VideoCapture(source)
+    if not cap.isOpened():
+        die(f"could not open video source: {source}")
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = fps if fps and fps > 0 else 25.0
+    if w == 0 or h == 0:
+        die(f"video has no readable frames: {source}")
 
-def process_input(input_path=None, input_type='video', save_output=True, conf_thresh=0.45, model_path=None):
-    """
-    Process different types of inputs for drone detection
-    Args:
-        input_path: Path to input file or folder
-        input_type: 'video', 'image', or 'webcam'
-        save_output: Whether to save detection results
-        conf_thresh: Confidence threshold for detections (0-1)
-        model_path: Custom path to YOLO model weights
-    """
-    # Load model
-    if model_path is None:
-        model_path = os.path.join('training_output', 'drone_detector', 'weights', 'best.pt')
-    
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model weights not found at {model_path}")
-    
-    logging.info(f"Loading model from {model_path}")
-    model = YOLO(model_path)
-    
-    # Initialize detection statistics
-    stats = {
-        'total_frames': 0,
-        'detected_objects': 0,
-        'avg_confidence': 0.0
-    }
-    
-    # Set up output paths
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_base = os.path.join('output')
-    ensure_dir(output_base)
+    from ultralytics import YOLO
+    model = YOLO(str(resolve_weights(weights)))
+    device = pick_device(device)
 
-    if input_type == 'image':
-        # Process single image
-        if input_path is None:
-            raise ValueError("Please provide input image path")
-        
-        # Read image
-        frame = cv2.imread(input_path)
-        if frame is None:
-            raise ValueError(f"Could not read image: {input_path}")
+    writer = None
+    if out_path:
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+        if not writer.isOpened():
+            die(f"could not open output file for writing: {out_path}")
+    show = show and has_display()
 
-        # Run inference
-        results = model.predict(
-            source=frame,
-            conf=0.45,
-            show=False
-        )
-
-        # Process and save results
-        for r in results:
-            annotated_frame = r.plot()
-            if save_output:
-                output_path = os.path.join(output_base, 'images', f'detection_{timestamp}.jpg')
-                cv2.imwrite(output_path, annotated_frame)
-                print(f"Saved detection result to: {output_path}")
-
-            # Display the frame
-            cv2.imshow('Drone Detection', annotated_frame)
-            cv2.waitKey(0)
-
-        cv2.destroyAllWindows()
-
-    else:  # video or webcam
-        # Set up video capture
-        cap = cv2.VideoCapture(0 if input_type == 'webcam' else input_path)
-        
-        # Check if video opened successfully
-        if not cap.isOpened():
-            print("Error: Could not open video source")
-            return
-
-        # Get video properties for output
-        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
-
-        # Set up video writer if saving output
-        out = None
-        if save_output and input_type != 'webcam':
-            output_path = os.path.join(output_base, 'videos', f'detection_{timestamp}.mp4')
-            out = cv2.VideoWriter(output_path, 
-                                cv2.VideoWriter_fourcc(*'mp4v'),
-                                fps, (frame_width, frame_height))
-            print(f"Saving video output to: {output_path}")
-
-        cv2.namedWindow('Drone Detection', cv2.WINDOW_NORMAL)
-        
-        while cap.isOpened():
-            success, frame = cap.read()
-            if not success:
+    frames = dets = 0
+    frames_with_det = 0
+    t0 = time.time()
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        r = model.predict(frame, conf=conf, iou=iou, imgsz=imgsz, device=device, verbose=False)[0]
+        n = len(r.boxes)
+        frames += 1
+        dets += n
+        frames_with_det += bool(n)
+        annotated = r.plot()
+        if writer:
+            writer.write(annotated)
+        if show:
+            cv2.imshow("Drone Detection (q to quit)", annotated)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
-                
-            # Run inference on frame
-            results = model.predict(
-                source=frame,
-                conf=0.45,
-                show=False,  # Don't show automatically
-                stream=True  # Enable streaming mode
-            )
-            
-            # Process results
-            for r in results:
-                annotated_frame = r.plot()
-                
-                # Save frame if video output is enabled
-                if out is not None:
-                    out.write(annotated_frame)
-
-                # Display the frame
-                cv2.imshow('Drone Detection', annotated_frame)
-                
-            # Break loop on 'q' press
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-        
-        # Cleanup
-        cap.release()
-        if out is not None:
-            out.write(annotated_frame)
+        if max_frames and frames >= max_frames:
+            break
+    cap.release()
+    if writer:
+        writer.release()
+    if show:
         cv2.destroyAllWindows()
+    elapsed = max(time.time() - t0, 1e-9)
+    stats = {"frames": frames, "detections": dets, "frames_with_detection": frames_with_det,
+             "fps": frames / elapsed, "output": str(out_path) if out_path else None}
+    if frames == 0:
+        print("warning: no frames could be read from the source")
+    return stats
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Detect drones in a video or webcam stream.")
+    ap.add_argument("source", help="video file path, or 'webcam'")
+    ap.add_argument("--weights", default=None, help="default: models/drone_best.pt")
+    ap.add_argument("--conf", type=float, default=0.45)
+    ap.add_argument("--iou", type=float, default=0.7)
+    ap.add_argument("--out", default=None,
+                    help="output video path (default: output/videos/<name>_detected.mp4)")
+    ap.add_argument("--no-save", action="store_true")
+    ap.add_argument("--show", action="store_true", help="show live window (needs a display)")
+    ap.add_argument("--max-frames", type=int, default=0)
+    ap.add_argument("--device", default=None)
+    args = ap.parse_args()
+
+    webcam = args.source == "webcam"
+    if not webcam and not Path(args.source).is_file():
+        die(f"video not found: {args.source}")
+    src = 0 if webcam else args.source
+    out = None
+    if not args.no_save and not webcam:
+        out = args.out or str(ROOT / "output" / "videos" / f"{Path(args.source).stem}_detected.mp4")
+    s = process_video(src, args.weights, args.conf, args.iou, out, args.show or webcam,
+                      args.max_frames, args.device)
+    print(f"Frames: {s['frames']}  detections: {s['detections']}  "
+          f"frames with a detection: {s['frames_with_detection']}  speed: {s['fps']:.1f} FPS")
+    if s["output"]:
+        print(f"Saved: {s['output']}")
+
 
 if __name__ == "__main__":
-    # Example usage:
-    
-    # For webcam
-    # process_input(input_type='webcam')
-    
-    # For video file
-    process_input(
-        input_path="/Users/parvashah/Desktop/DS Projects/Drone Detection System/Testing Videos/27363-363524166_medium.mp4",
-        input_type='video',
-        save_output=True
-    )
-    
-    # For image file
-    # process_input(
-    #     input_path="path_to_image.jpg",
-    #     input_type='image',
-    #     save_output=True
-    # )
+    main()

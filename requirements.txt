@@ -1,7 +1,5 @@
-numpy
+ultralytics>=8.3
 opencv-python
-tensorflow
-torch
-torchvision
-onnxruntime
+numpy
+pyyaml
 matplotlib

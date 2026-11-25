@@ -1,94 +1,59 @@
-import os
+"""Split a flat folder of image + YOLO label (.txt) pairs into train/val."""
+import argparse
+import random
 import shutil
-from sklearn.model_selection import train_test_split
-import glob
+from pathlib import Path
 
-def organize_dataset():
-    # Define paths
-    base_dir = os.path.dirname(os.path.dirname(__file__))
-    source_dir = os.path.join(base_dir, 'drone_dataset_yolo')
-    
-    print(f"Looking for images in: {source_dir}")
-    
-    # Create necessary directories
-    train_img_dir = os.path.join(source_dir, 'train', 'images')
-    train_label_dir = os.path.join(source_dir, 'train', 'labels')
-    val_img_dir = os.path.join(source_dir, 'val', 'images')
-    val_label_dir = os.path.join(source_dir, 'val', 'labels')
-    
-    for dir_path in [train_img_dir, train_label_dir, val_img_dir, val_label_dir]:
-        os.makedirs(dir_path, exist_ok=True)
-    
-    # Search recursively for image files
-    image_files = []
-    for ext in ['*.jpg', '*.png', '*.jpeg']:
-        image_files.extend(glob.glob(os.path.join(source_dir, '**', ext), recursive=True))
-    
-    if not image_files:
-        print("No image files found! Please check the source directory structure.")
-        print("Expected structure:")
-        print(f"{source_dir}/")
-        print("    ├── images/")
-        print("    │   └── *.jpg/png")
-        print("    └── labels/")
-        print("        └── *.txt")
-        return
-    
-    print(f"Found {len(image_files)} images")
-    
-    # Get all label files
-    label_files = glob.glob(os.path.join(source_dir, '**', '*.txt'), recursive=True)
-    print(f"Found {len(label_files)} label files")
-    
-    # Split into train and validation sets (80/20)
-    train_images, val_images = train_test_split(image_files, test_size=0.2, random_state=42)
-    
-    # Counter for successful copies
-    train_copied = 0
-    val_copied = 0
-    
-    # Move files to respective directories
-    for img_path in train_images:
-        img_filename = os.path.basename(img_path)
-        label_filename = os.path.splitext(img_filename)[0] + '.txt'
-        
-        # Move image
-        shutil.copy2(img_path, os.path.join(train_img_dir, img_filename))
-        
-        # Find and move corresponding label
-        possible_label_paths = [
-            os.path.join(os.path.dirname(img_path), '..', 'labels', label_filename),
-            os.path.join(os.path.dirname(img_path), label_filename)
-        ]
-        
-        for label_path in possible_label_paths:
-            if os.path.exists(label_path):
-                shutil.copy2(label_path, os.path.join(train_label_dir, label_filename))
-                train_copied += 1
+from common import DATASET_DIR, IMAGE_EXTS, die
+
+
+def find_pairs(source):
+    """Return [(image, label)] for images in `source` (recursive) that have a same-named .txt
+    next to them or in a sibling labels/ folder. Images without labels are skipped."""
+    pairs = []
+    for img in sorted(Path(source).rglob("*")):
+        if img.suffix.lower() not in IMAGE_EXTS:
+            continue
+        for lab in (img.with_suffix(".txt"), img.parent.parent / "labels" / (img.stem + ".txt")):
+            if lab.is_file():
+                pairs.append((img, lab))
                 break
-    
-    for img_path in val_images:
-        img_filename = os.path.basename(img_path)
-        label_filename = os.path.splitext(img_filename)[0] + '.txt'
-        
-        # Move image
-        shutil.copy2(img_path, os.path.join(val_img_dir, img_filename))
-        
-        # Find and move corresponding label
-        possible_label_paths = [
-            os.path.join(os.path.dirname(img_path), '..', 'labels', label_filename),
-            os.path.join(os.path.dirname(img_path), label_filename)
-        ]
-        
-        for label_path in possible_label_paths:
-            if os.path.exists(label_path):
-                shutil.copy2(label_path, os.path.join(val_label_dir, label_filename))
-                val_copied += 1
-                break
-    
-    print("\nDataset organization completed!")
-    print(f"Training set: {len(train_images)} images, {train_copied} labels")
-    print(f"Validation set: {len(val_images)} images, {val_copied} labels")
+    return pairs
+
+
+def split_pairs(pairs, val_fraction=0.2, seed=42):
+    """Deterministic shuffle split into (train, val)."""
+    pairs = list(pairs)
+    random.Random(seed).shuffle(pairs)
+    n_val = int(round(len(pairs) * val_fraction))
+    if len(pairs) > 1:
+        n_val = min(max(n_val, 1), len(pairs) - 1)
+    return pairs[n_val:], pairs[:n_val]
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Create train/val folders from image+label pairs.")
+    ap.add_argument("--source", default=str(DATASET_DIR / "dataset_txt"),
+                    help="folder with images and same-named .txt labels")
+    ap.add_argument("--dest", default=str(DATASET_DIR))
+    ap.add_argument("--val-fraction", type=float, default=0.2)
+    ap.add_argument("--seed", type=int, default=42)
+    a = ap.parse_args()
+
+    if not Path(a.source).is_dir():
+        die(f"source folder not found: {a.source}")
+    pairs = find_pairs(a.source)
+    if not pairs:
+        die(f"no image/label pairs found under {a.source}")
+    train, val = split_pairs(pairs, a.val_fraction, a.seed)
+    for name, items in (("train", train), ("val", val)):
+        for sub in ("images", "labels"):
+            (Path(a.dest) / name / sub).mkdir(parents=True, exist_ok=True)
+        for img, lab in items:
+            shutil.copy2(img, Path(a.dest) / name / "images" / img.name)
+            shutil.copy2(lab, Path(a.dest) / name / "labels" / lab.name)
+    print(f"train: {len(train)} pairs, val: {len(val)} pairs -> {a.dest}")
+
 
 if __name__ == "__main__":
-    organize_dataset()
+    main()
